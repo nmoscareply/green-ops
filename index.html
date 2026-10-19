@@ -254,6 +254,13 @@ textarea.small{min-height:80px}
 .gear{flex:none;width:40px;height:40px;display:grid;place-items:center;border:1px solid var(--line2);background:var(--surface2);color:var(--ink);padding:0;margin-left:2px}
 .tgl.big{padding:14px 10px;font-size:15px;background:var(--green);color:var(--green-ink);border-color:var(--green)}
 .filebtn{display:inline-block;text-align:center;cursor:pointer}
+.gear{position:relative}
+.gear::after{content:"";position:absolute;top:5px;right:5px;width:8px;height:8px;border-radius:50%;background:var(--dim);box-shadow:0 0 0 2px var(--surface2)}
+.gear[data-sync="ok"]::after{background:var(--green)}
+.gear[data-sync="busy"]::after,.gear[data-sync="pending"]::after,.gear[data-sync="offline"]::after{background:var(--warn)}
+.gear[data-sync="error"]::after,.gear[data-sync="auth"]::after{background:var(--danger)}
+.welcome{display:flex;flex-direction:column;gap:12px;text-align:left;font-family:var(--f-body);font-size:15px;color:var(--ink);line-height:1.45}
+.w-err{font-family:var(--f-mono);font-size:12px;color:var(--warn)}
 .toast{position:fixed;left:50%;bottom:calc(150px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);z-index:60;background:var(--green);color:var(--green-ink);padding:10px 16px;font-family:var(--f-mono);font-size:13px;font-weight:700;max-width:calc(100% - 32px);text-align:center;box-shadow:0 0 22px rgba(193,255,114,.4)}
 @media (prefers-reduced-motion: reduce){.sheet,.segbar i{transition:none}.hud .dot{animation:none}}
 @media (min-width:600px){.code{font-size:32px}}
@@ -463,7 +470,11 @@ textarea.small{min-height:80px}
       <section class="hero">
         <div class="hero-big" id="s-count"></div>
         <div class="hero-sub" id="s-last"></div>
-        <div class="hero-sub">I dati sono salvati solo su questo telefono, dentro l'app. Esporta un backup ogni tanto e mandalo a Claude quando vuoi che legga le tue note.</div>
+        <div class="hero-sub">I dati sono salvati sul telefono e, se colleghi l'archivio online, anche nel tuo repository privato su GitHub, dove Claude può leggerli.</div>
+      </section>
+      <section class="blk">
+        <h3 class="bh">Archivio online</h3>
+        <div id="s-sync" class="blk" style="gap:10px"></div>
       </section>
       <section class="blk">
         <h3 class="bh">Esporta</h3>
@@ -916,74 +927,198 @@ textarea.small{min-height:80px}
 
   render();
 
-  /* ---------- data: saved on this device ---------- */
+  /* ---------- data: saved on this device, synced to a private GitHub repo ---------- */
   const KEY='greenops-v1', META='greenops-meta';
+  const REPO='nmoscareply/green-ops-dati', FILE='data.json', BRANCH='main';
   function readMeta(){ try{ return JSON.parse(localStorage.getItem(META)||'{}')||{}; }catch(e){ return {}; } }
   function writeMeta(m){ try{ localStorage.setItem(META,JSON.stringify(Object.assign(readMeta(),m))); }catch(e){} }
-  function makeLocalDb(){
+  const cp=o=>JSON.parse(JSON.stringify(o));
+  const nowIso=()=>new Date().toISOString();
+  function makeLocalDb(onLocal){
     let data=null; try{ data=JSON.parse(localStorage.getItem(KEY)||'null'); }catch(e){ data=null; }
     if(!data||typeof data!=='object') data={};
-    data.editori=data.editori||{}; data.appuntamenti=data.appuntamenti||{};
+    data.editori=data.editori||{}; data.appuntamenti=data.appuntamenti||{}; data.deleted=data.deleted||{};
     const subs={editori:[],appuntamenti:[]};
-    const cp=o=>JSON.parse(JSON.stringify(o));
     function persist(){ try{ localStorage.setItem(KEY,JSON.stringify(data)); }catch(e){ toast('Non riesco a salvare sul telefono. Esporta subito un backup.'); throw {code:'unavailable'}; } }
     function emit(c){ const snap={docs:Object.entries(data[c]).map(([id,d])=>({id,exists:true,data:()=>d}))}; subs[c].forEach(f=>f(snap)); }
     return {
-      raw:()=>cp({editori:data.editori,appuntamenti:data.appuntamenti}),
-      replaceAll(nd){ data={editori:cp(nd.editori||{}),appuntamenti:cp(nd.appuntamenti||{})}; persist(); emit('editori'); emit('appuntamenti'); },
+      raw:()=>cp({editori:data.editori,appuntamenti:data.appuntamenti,deleted:data.deleted}),
+      isEmpty:()=>!Object.keys(data.editori).length&&!Object.keys(data.appuntamenti).length,
+      replaceAll(nd,silent){ data={editori:cp(nd.editori||{}),appuntamenti:cp(nd.appuntamenti||{}),deleted:cp(nd.deleted||{})}; persist(); emit('editori'); emit('appuntamenti'); if(!silent) onLocal(); },
       collection(c){ return {
         doc(id){ return {
-          update:async p=>{ if(!data[c][id]) throw {code:'invalid_argument'}; data[c][id]=Object.assign({},data[c][id],cp(p)); persist(); emit(c); },
-          set:async body=>{ data[c][id]=cp(body); persist(); emit(c); },
-          delete:async()=>{ delete data[c][id]; persist(); emit(c); }
+          update:async p=>{ if(!data[c][id]) throw {code:'invalid_argument'}; data[c][id]=Object.assign({},data[c][id],cp(p)); persist(); emit(c); onLocal(); },
+          set:async body=>{ data[c][id]=cp(body); delete data.deleted[c+'/'+id]; persist(); emit(c); onLocal(); },
+          delete:async()=>{ delete data[c][id]; data.deleted[c+'/'+id]=nowIso(); persist(); emit(c); onLocal(); }
         }; },
         onSnapshot(next){ subs[c].push(next); setTimeout(()=>emit(c),0); return ()=>{}; }
       }; }
     };
   }
-  db=makeLocalDb();
+
+  /* ---------- sync ---------- */
+  const Sync={busy:false,timer:null,state:'off',err:''};
+  const token=()=>readMeta().token||'';
+  const b64e=s=>btoa(unescape(encodeURIComponent(s)));
+  const b64d=s=>decodeURIComponent(escape(atob(String(s).replace(/\s/g,''))));
+  async function gh(method,body,tk){
+    return fetch('https://api.github.com/repos/'+REPO+'/contents/'+FILE+(method==='GET'?'?ref='+BRANCH+'&t='+Date.now():''),{
+      method,cache:'no-store',
+      headers:{'Accept':'application/vnd.github+json','Authorization':'Bearer '+(tk||token()),'X-GitHub-Api-Version':'2022-11-28'},
+      body:body?JSON.stringify(body):undefined});
+  }
+  async function pull(tk){
+    const r=await gh('GET',null,tk);
+    if(r.status===404) return {missing:true};
+    if(r.status===401||r.status===403) throw {auth:true,status:r.status};
+    if(!r.ok) throw {status:r.status};
+    const j=await r.json();
+    let d=null; try{ d=JSON.parse(b64d(j.content)); }catch(e){ throw {status:'parse'}; }
+    return {sha:j.sha,data:d};
+  }
+  async function push(sha){
+    const content=JSON.stringify(Object.assign({app:'green-ops',version:1,exportedAt:nowIso()},db.raw()),null,1);
+    const body={message:'Green Ops sync '+nowIso(),content:b64e(content),branch:BRANCH}; if(sha) body.sha=sha;
+    const r=await gh('PUT',body);
+    if(r.status===409||r.status===422) return {conflict:true};
+    if(r.status===401||r.status===403) throw {auth:true,status:r.status};
+    if(!r.ok) throw {status:r.status};
+    const j=await r.json(); return {sha:j.content.sha};
+  }
+  function merge(L,R){
+    L=L||{}; R=R||{};
+    const out={editori:{},appuntamenti:{},deleted:{}};
+    [R.deleted||{},L.deleted||{}].forEach(dm=>Object.keys(dm).forEach(k=>{ if(!out.deleted[k]||dm[k]>out.deleted[k]) out.deleted[k]=dm[k]; }));
+    ['editori','appuntamenti'].forEach(c=>{
+      const a=L[c]||{}, b=R[c]||{};
+      new Set([...Object.keys(a),...Object.keys(b)]).forEach(id=>{
+        const x=a[id], y=b[id]; const w=!x?y:!y?x:((x.aggiornato||'')>=(y.aggiornato||'')?x:y);
+        const del=out.deleted[c+'/'+id]; if(del && (!w.aggiornato || del>=w.aggiornato)) return;
+        out[c][id]=w;
+      });
+    });
+    return out;
+  }
+  function setSync(state,err){
+    Sync.state=state; Sync.err=err||'';
+    const g=$('open-settings'); g.dataset.sync=state;
+    if($('ssheet').classList.contains('open')) fillSyncBox();
+  }
+  async function pushResolving(sha){
+    let p=await push(sha);
+    if(p.conflict){ const rem=await pull(); db.replaceAll(merge(db.raw(),rem.missing?{}:rem.data),true); p=await push(rem.missing?null:rem.sha); if(p.conflict) throw {status:409}; }
+    return p;
+  }
+  async function syncNow(){
+    if(!token()||Sync.busy) return;
+    if(!navigator.onLine){ setSync(readMeta().dirty?'pending':'offline'); return; }
+    Sync.busy=true; setSync('busy');
+    try{
+      const m=readMeta(); const rem=await pull();
+      if(rem.missing){ const p=await pushResolving(null); writeMeta({sha:p.sha,dirty:false,force:false}); }
+      else if(m.force){ const p=await pushResolving(rem.sha); writeMeta({sha:p.sha,dirty:false,force:false}); }
+      else if(rem.sha!==m.sha){
+        if(m.dirty){ db.replaceAll(merge(db.raw(),rem.data),true); const p=await pushResolving(rem.sha); writeMeta({sha:p.sha,dirty:false}); }
+        else { db.replaceAll(merge({},rem.data),true); writeMeta({sha:rem.sha}); }
+      } else if(m.dirty){ const p=await pushResolving(m.sha); writeMeta({sha:p.sha,dirty:false}); }
+      writeMeta({lastSync:nowIso()});
+      setSync('ok');
+    }catch(e){
+      if(e&&e.auth) setSync('auth','La chiave non funziona più (scaduta o revocata). Inseriscine una nuova nelle Impostazioni.');
+      else if(!navigator.onLine) setSync(readMeta().dirty?'pending':'offline');
+      else setSync('error','Sincronizzazione non riuscita ('+(e&&e.status||'rete')+'). Riprovo da solo tra poco.');
+    }finally{ Sync.busy=false; }
+  }
+  function onLocalChange(){ writeMeta({dirty:true}); if(!token()) return; setSync(navigator.onLine?'pending':'offline'); clearTimeout(Sync.timer); Sync.timer=setTimeout(syncNow,4000); }
+
+  db=makeLocalDb(onLocalChange);
   try{ if(navigator.storage&&navigator.storage.persist) navigator.storage.persist(); }catch(e){}
+
+  function emptyState(){
+    if(token()) return '&gt; nessun dato sul telefono. Sto cercando il tuo archivio online…';
+    return '<div class="welcome"><b>Non ci sono dati su questo telefono.</b><br>Vuoi caricarli? Inserisci la tua chiave di accesso.'+
+      '<input class="inp sm" id="w-token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="github_pat_…">'+
+      '<button class="tgl ok big" type="button" id="w-go">Collega e carica i dati</button>'+
+      '<button class="btn link" type="button" data-open-settings>Oppure importa un file</button><span class="w-err" id="w-err"></span></div>';
+  }
   ['editori','appuntamenti'].forEach(c=>{
     db.collection(c).onSnapshot(snap=>{
       const next=new Map(); snap.docs.forEach(x=>{ if(x.exists) next.set(x.id,x.data()); });
       store[c]=next; loaded[c]=true;
       const empty=!store.editori.size&&!store.appuntamenti.size;
-      $('status').hidden=!(loaded.editori&&loaded.appuntamenti&&empty);
-      if(empty) $('status').innerHTML='&gt; nessun dato su questo telefono.<br><br><button class="tgl ok big" type="button" data-open-settings>Importa il file dati</button>';
+      const st=$('status'); st.hidden=!(loaded.editori&&loaded.appuntamenti&&empty);
+      if(empty && !(document.activeElement&&document.activeElement.id==='w-token')) st.innerHTML=emptyState();
       render();
     });
   });
 
-  /* ---------- settings: export / import ---------- */
+  async function connect(tk,errEl){
+    tk=String(tk||'').trim();
+    if(!tk){ errEl.textContent='Inserisci la chiave.'; return false; }
+    errEl.textContent='Mi collego…';
+    try{
+      const rem=await pull(tk);
+      if(rem.missing){ errEl.textContent='Collegata, ma l\'archivio online è vuoto.'; writeMeta({token:tk,sha:null,dirty:!db.isEmpty()}); syncNow(); return true; }
+      writeMeta({token:tk});
+      if(db.isEmpty()){ db.replaceAll(merge({},rem.data),true); writeMeta({sha:rem.sha,dirty:false,lastSync:nowIso()}); setSync('ok'); }
+      else { writeMeta({sha:null,dirty:true}); await syncNow(); }
+      errEl.textContent=''; toast('Collegata. Dati caricati.');
+      return true;
+    }catch(e){
+      errEl.textContent=e&&e.auth?'Chiave non valida o senza accesso all\'archivio. Controlla di averla copiata tutta.':(!navigator.onLine?'Sei offline: collegati a internet e riprova.':'Non riesco a raggiungere GitHub ('+(e&&e.status||'rete')+'). Riprova.');
+      return false;
+    }
+  }
+  document.addEventListener('click',async e=>{
+    if(e.target.closest('[data-open-settings]')){ openS(); return; }
+    if(e.target.closest('#w-go')){ const b=e.target.closest('#w-go'); b.disabled=true; await connect($('w-token').value,$('w-err')); b.disabled=false; }
+  });
+
+  /* ---------- settings ---------- */
   const fmtDate=iso=>{ try{ return new Date(iso).toLocaleString('it-IT',{weekday:'short',day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}); }catch(e){ return iso; } };
+  const SYNC_L={ok:'Sincronizzato',busy:'Sincronizzo…',pending:'Modifiche in attesa di invio',offline:'Offline: invio appena torna la rete',error:'Errore di sincronizzazione',auth:'Chiave non valida',off:'Non collegato'};
+  function fillSyncBox(){
+    const m=readMeta(); const box=$('s-sync');
+    if(!m.token){ box.innerHTML='<p class="asked">Non collegato. Incolla la chiave di accesso per salvare i dati anche online e caricarli su un altro telefono.</p><input class="inp sm" id="s-token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="github_pat_…"><button class="tgl ok big" type="button" id="s-connect">Collega</button><span class="w-err" id="s-err"></span>'; return; }
+    const st=Sync.state==='off'?(m.dirty?'pending':'ok'):Sync.state;
+    box.innerHTML='<p class="sum"><b>'+esc(SYNC_L[st]||st)+'</b><br><span class="asked">Archivio privato: '+esc(REPO)+(m.lastSync?' · ultimo sync '+esc(fmtDate(m.lastSync)):'')+'</span>'+(Sync.err?'<br><span class="w-err">'+esc(Sync.err)+'</span>':'')+'</p>'+
+      '<button class="btn sm" type="button" id="s-syncnow">Sincronizza ora</button>'+
+      (st==='auth'?'<input class="inp sm" id="s-token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Nuova chiave github_pat_…"><button class="tgl ok big" type="button" id="s-connect">Aggiorna chiave</button><span class="w-err" id="s-err"></span>':'')+
+      '<button class="danger" type="button" id="s-unlink">Scollega questo telefono</button>';
+  }
   function fillS(){
     const r=db.raw(); const ne=Object.keys(r.editori).length, na=Object.keys(r.appuntamenti).length;
     $('s-count').textContent=ne+' editori · '+na+' appuntamenti e ritiri';
     const m=readMeta();
     $('s-last').textContent=(m.lastExport?'Ultimo export: '+fmtDate(m.lastExport):'Nessun export ancora')+(m.lastImport?' · Ultimo import: '+fmtDate(m.lastImport):'');
-    $('s-confirm').innerHTML=''; $('s-wipe').innerHTML='<button class="danger" type="button" data-wipe="ask">× Cancella tutti i dati dal telefono</button>';
+    fillSyncBox();
+    $('s-confirm').innerHTML=''; $('s-wipe').innerHTML='<button class="danger" type="button" data-wipe="ask">× Cancella tutti i dati</button>';
   }
   function openS(){ fillS(); $('ssheet').classList.add('open'); $('ssheet').querySelector('.sh-body').scrollTop=0; document.body.style.overflow='hidden'; }
   function closeS(){ $('ssheet').classList.remove('open'); if(!openE&&!openA) document.body.style.overflow=''; }
   $('open-settings').addEventListener('click',openS);
   $('s-close').addEventListener('click',closeS);
-  document.addEventListener('click',e=>{ if(e.target.closest('[data-open-settings]')) openS(); });
-  function payload(){ return JSON.stringify(Object.assign({app:'green-ops',version:1,exportedAt:new Date().toISOString()},db.raw()),null,1); }
+  $('s-sync').addEventListener('click',async e=>{
+    if(e.target.closest('#s-connect')){ const b=e.target.closest('#s-connect'); b.disabled=true; const ok=await connect($('s-token').value,$('s-err')); b.disabled=false; if(ok) fillS(); }
+    else if(e.target.closest('#s-syncnow')){ await syncNow(); fillS(); }
+    else if(e.target.closest('#s-unlink')){ writeMeta({token:'',sha:null}); setSync('off'); fillS(); toast('Telefono scollegato. I dati restano qui.'); }
+  });
+  function payload(){ return JSON.stringify(Object.assign({app:'green-ops',version:1,exportedAt:nowIso()},db.raw()),null,1); }
   function stamp(){ const d=new Date(), p=n=>String(n).padStart(2,'0'); return d.getFullYear()+p(d.getMonth()+1)+p(d.getDate())+'-'+p(d.getHours())+p(d.getMinutes()); }
   $('s-export').addEventListener('click',async()=>{
     const name='green-ops-dati-'+stamp()+'.json'; const json=payload();
     let file=null; try{ file=new File([json],name,{type:'application/json'}); }catch(e){}
     if(file && navigator.canShare && navigator.canShare({files:[file]})){
-      try{ await navigator.share({files:[file],title:'Green Ops · dati'}); writeMeta({lastExport:new Date().toISOString()}); fillS(); toast('Backup esportato'); return; }
+      try{ await navigator.share({files:[file],title:'Green Ops · dati'}); writeMeta({lastExport:nowIso()}); fillS(); toast('Backup esportato'); return; }
       catch(e){ if(e&&e.name==='AbortError') return; }
     }
     const url=URL.createObjectURL(new Blob([json],{type:'application/json'})); const a=document.createElement('a'); a.href=url; a.download=name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(url),5000);
-    writeMeta({lastExport:new Date().toISOString()}); fillS(); toast('Backup scaricato');
+    writeMeta({lastExport:nowIso()}); fillS(); toast('Backup scaricato');
   });
   $('s-copy').addEventListener('click',()=>{
     const json=payload();
     const fb=()=>{ const t=$('s-paste'); t.closest('details').open=true; t.value=json; t.focus(); t.select(); toast('Testo selezionato: copialo dal menu'); };
-    try{ navigator.clipboard.writeText(json).then(()=>{ writeMeta({lastExport:new Date().toISOString()}); fillS(); toast('Dati copiati negli appunti'); },fb); }catch(e){ fb(); }
+    try{ navigator.clipboard.writeText(json).then(()=>{ writeMeta({lastExport:nowIso()}); fillS(); toast('Dati copiati negli appunti'); },fb); }catch(e){ fb(); }
   });
   let pending=null;
   function stageImport(text,source){
@@ -991,17 +1126,25 @@ textarea.small{min-height:80px}
     if(!d||typeof d!=='object'||typeof d.editori!=='object'||typeof d.appuntamenti!=='object'){ toast('Il file non contiene editori e appuntamenti.'); return; }
     pending=d;
     const ne=Object.keys(d.editori).length, na=Object.keys(d.appuntamenti).length;
-    $('s-confirm').innerHTML='<div class="leave" style="padding:10px"><span>'+esc(source)+': '+ne+' editori, '+na+' appuntamenti'+(d.exportedAt?' · esportato '+esc(fmtDate(d.exportedAt)):'')+'. Sostituire i dati sul telefono?</span><button type="button" class="ok" data-imp="yes">Importa</button><button type="button" data-imp="no">Annulla</button></div>';
+    $('s-confirm').innerHTML='<div class="leave" style="padding:10px"><span>'+esc(source)+': '+ne+' editori, '+na+' appuntamenti'+(d.exportedAt?' · esportato '+esc(fmtDate(d.exportedAt)):'')+'. Sostituire i dati'+(token()?' sul telefono e online':' sul telefono')+'?</span><button type="button" class="ok" data-imp="yes">Importa</button><button type="button" data-imp="no">Annulla</button></div>';
   }
   $('s-file').addEventListener('change',()=>{ const f=$('s-file').files[0]; if(!f) return; const r=new FileReader(); r.onload=()=>stageImport(String(r.result),f.name); r.readAsText(f); $('s-file').value=''; });
   $('s-paste-go').addEventListener('click',()=>{ const v=$('s-paste').value.trim(); if(v) stageImport(v,'Testo incollato'); });
   $('s-confirm').addEventListener('click',e=>{ const b=e.target.closest('[data-imp]'); if(!b) return;
-    if(b.dataset.imp==='yes'&&pending){ try{ db.replaceAll(pending); writeMeta({lastImport:new Date().toISOString()}); pending=null; $('s-paste').value=''; fillS(); toast('Dati importati'); }catch(err){} }
+    if(b.dataset.imp==='yes'&&pending){ try{ db.replaceAll({editori:pending.editori,appuntamenti:pending.appuntamenti,deleted:{}}); writeMeta({lastImport:nowIso(),force:true}); pending=null; $('s-paste').value=''; fillS(); toast('Dati importati'); }catch(err){} }
     else { pending=null; $('s-confirm').innerHTML=''; } });
   $('s-wipe').addEventListener('click',e=>{ const b=e.target.closest('[data-wipe]'); if(!b) return;
-    if(b.dataset.wipe==='ask') $('s-wipe').innerHTML='<div class="confirm"><span>Cancellare tutto? Fallo solo dopo aver esportato un backup.</span><button class="btn yes" type="button" data-wipe="yes">Cancella</button><button class="btn" type="button" data-wipe="no">Annulla</button></div>';
+    if(b.dataset.wipe==='ask') $('s-wipe').innerHTML='<div class="confirm"><span>Cancellare tutto'+(token()?', anche online':'')+'? Fallo solo dopo aver esportato un backup.</span><button class="btn yes" type="button" data-wipe="yes">Cancella</button><button class="btn" type="button" data-wipe="no">Annulla</button></div>';
     else if(b.dataset.wipe==='no') fillS();
-    else { db.replaceAll({editori:{},appuntamenti:{}}); fillS(); toast('Dati cancellati'); } });
+    else { db.replaceAll({editori:{},appuntamenti:{},deleted:{}}); writeMeta({force:true}); fillS(); toast('Dati cancellati'); } });
+
+  /* ---------- sync triggers ---------- */
+  setSync(token()?(readMeta().dirty?'pending':'ok'):'off');
+  if(token()) setTimeout(syncNow,600);
+  setInterval(()=>{ if(!document.hidden && token()) syncNow(); },90000);
+  document.addEventListener('visibilitychange',()=>{ if(!document.hidden && token()) syncNow(); });
+  window.addEventListener('online',()=>{ if(token()) syncNow(); });
+  window.addEventListener('offline',()=>{ if(token()) setSync(readMeta().dirty?'pending':'offline'); });
 
   if('serviceWorker' in navigator && /^https?:$/.test(location.protocol)){ window.addEventListener('load',()=>{ navigator.serviceWorker.register('sw.js').catch(()=>{}); }); }
 })();
